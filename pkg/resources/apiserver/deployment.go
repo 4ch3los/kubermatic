@@ -69,6 +69,11 @@ func DeploymentReconciler(data *resources.TemplateData, enableOIDCAuthentication
 
 	return func() (string, reconciling.DeploymentReconciler) {
 		return resources.ApiserverDeploymentName, func(dep *appsv1.Deployment) (*appsv1.Deployment, error) {
+			var authWebhookSecret *string
+			if val, ok := data.Cluster().ObjectMeta.Labels["auth-webhook-secret"]; ok {
+				authWebhookSecret = &val
+			}
+
 			baseLabels := resources.BaseAppLabels(resources.ApiserverDeploymentName, nil)
 			kubernetes.EnsureLabels(dep, baseLabels)
 
@@ -87,8 +92,8 @@ func DeploymentReconciler(data *resources.TemplateData, enableOIDCAuthentication
 			auditLogEnabled := data.Cluster().Spec.AuditLogging != nil && data.Cluster().Spec.AuditLogging.Enabled
 			auditWebhookBackendEnabled := data.Cluster().Spec.AuditLogging != nil && data.Cluster().Spec.AuditLogging.WebhookBackend != nil
 
-			volumes := getVolumes(data, enableEncryptionConfiguration, auditLogEnabled, auditWebhookBackendEnabled)
-			volumeMounts := getVolumeMounts(data.IsKonnectivityEnabled(), enableEncryptionConfiguration, auditWebhookBackendEnabled)
+			volumes := getVolumes(data, enableEncryptionConfiguration, auditLogEnabled, auditWebhookBackendEnabled, authWebhookSecret)
+			volumeMounts := getVolumeMounts(data.IsKonnectivityEnabled(), enableEncryptionConfiguration, auditWebhookBackendEnabled, authWebhookSecret != nil)
 
 			version := data.Cluster().Status.Versions.Apiserver.Semver()
 
@@ -150,7 +155,7 @@ func DeploymentReconciler(data *resources.TemplateData, enableOIDCAuthentication
 				}
 			}
 
-			flags, err := getApiserverFlags(data, etcdEndpoints, enableOIDCAuthentication, auditLogEnabled, enableEncryptionConfiguration, auditWebhookBackendEnabled)
+			flags, err := getApiserverFlags(data, etcdEndpoints, enableOIDCAuthentication, auditLogEnabled, enableEncryptionConfiguration, auditWebhookBackendEnabled, authWebhookSecret != nil)
 			if err != nil {
 				return nil, err
 			}
@@ -282,7 +287,7 @@ func DeploymentReconciler(data *resources.TemplateData, enableOIDCAuthentication
 	}
 }
 
-func getApiserverFlags(data *resources.TemplateData, etcdEndpoints []string, enableOIDCAuthentication, auditLogEnabled, enableEncryption, auditWebhookEnabled bool) ([]string, error) {
+func getApiserverFlags(data *resources.TemplateData, etcdEndpoints []string, enableOIDCAuthentication, auditLogEnabled, enableEncryption, auditWebhookEnabled bool, authWebhookEnabled bool) ([]string, error) {
 	overrideFlags, err := getApiserverOverrideFlags(data)
 	if err != nil {
 		return nil, fmt.Errorf("could not get components override flags: %w", err)
@@ -317,6 +322,12 @@ func getApiserverFlags(data *resources.TemplateData, etcdEndpoints []string, ena
 
 	address := data.Cluster().Status.Address
 
+	authModes := "Node,RBAC"
+
+	if authWebhookEnabled {
+		authModes += ",Webhook"
+	}
+
 	serviceAccountKeyFile := filepath.Join("/etc/kubernetes/service-account-key", resources.ServiceAccountKeySecretKey)
 	flags := []string{
 		"--etcd-servers", strings.Join(etcdEndpoints, ","),
@@ -326,7 +337,7 @@ func getApiserverFlags(data *resources.TemplateData, etcdEndpoints []string, ena
 		"--storage-backend", "etcd3",
 		"--enable-admission-plugins", strings.Join(sets.List(admissionPlugins), ","),
 		"--admission-control-config-file", "/etc/kubernetes/adm-control/admission-control.yaml",
-		"--authorization-mode", "Node,RBAC",
+		"--authorization-mode", authModes,
 		"--external-hostname", address.ExternalName,
 		"--token-auth-file", "/etc/kubernetes/tokens/tokens.csv",
 		"--enable-bootstrap-token-auth",
@@ -482,6 +493,10 @@ func getApiserverFlags(data *resources.TemplateData, etcdEndpoints []string, ena
 			"/etc/kubernetes/encryption-configuration/encryption-configuration.yaml")
 	}
 
+	if authWebhookEnabled {
+		flags = append(flags, "--authorization-webhook-config-file", "/etc/kubernetes/auth-webhook.yml")
+	}
+
 	return flags, nil
 }
 
@@ -501,7 +516,7 @@ func getApiserverOverrideFlags(data *resources.TemplateData) (kubermaticv1.APISe
 	return settings, nil
 }
 
-func getVolumeMounts(isKonnectivityEnabled, isEncryptionEnabled bool, isAuditWebhookEnabled bool) []corev1.VolumeMount {
+func getVolumeMounts(isKonnectivityEnabled, isEncryptionEnabled bool, isAuditWebhookEnabled bool, authWebhook bool) []corev1.VolumeMount {
 	vms := []corev1.VolumeMount{
 		{
 			MountPath: "/etc/kubernetes/tls",
@@ -600,10 +615,19 @@ func getVolumeMounts(isKonnectivityEnabled, isEncryptionEnabled bool, isAuditWeb
 		})
 	}
 
+	if authWebhook {
+		vms = append(vms, corev1.VolumeMount{
+			Name:      "auth-webhook",
+			MountPath: "/etc/kubernetes/auth-webhook.yml",
+			SubPath:   "auth-webhook.yml",
+			ReadOnly:  true,
+		})
+	}
+
 	return vms
 }
 
-func getVolumes(data *resources.TemplateData, isEncryptionEnabled, isAuditEnabled bool, isAuditWebhookEnabled bool) []corev1.Volume {
+func getVolumes(data *resources.TemplateData, isEncryptionEnabled, isAuditEnabled bool, isAuditWebhookEnabled bool, authWebhookSecret *string) []corev1.Volume {
 	vs := []corev1.Volume{
 		{
 			Name: resources.ApiserverTLSSecretName,
@@ -809,6 +833,17 @@ func getVolumes(data *resources.TemplateData, isEncryptionEnabled, isAuditEnable
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: data.Cluster().Spec.AuditLogging.WebhookBackend.AuditWebhookConfig.Name,
+				},
+			},
+		})
+	}
+
+	if authWebhookSecret != nil {
+		vs = append(vs, corev1.Volume{
+			Name: "auth-webhook",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: *authWebhookSecret,
 				},
 			},
 		})
